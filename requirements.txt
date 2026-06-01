@@ -3,5 +3,7 @@ uvicorn==0.34.2
 httpx==0.28.1
 numpy==2.2.5
 pandas==2.2.3
-yfinance==0.2.58
 python-multipart==0.0.20
+anyio==4.9.0
+starlette==0.46.2
+pydantic==2.11.5
