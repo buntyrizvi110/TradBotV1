@@ -1,52 +1,72 @@
-
-import os, json
+import os
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 from fastapi import FastAPI, Query, Form
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+CAPITAL_API_KEY = os.getenv("CAPITAL_API_KEY", "")
+CAPITAL_IDENTIFIER = os.getenv("CAPITAL_IDENTIFIER", "")
+CAPITAL_PASSWORD = os.getenv("CAPITAL_PASSWORD", "")
 
-AUTO_TRADE = os.getenv("AUTO_TRADE", "false").lower() == "true"
+CAPITAL_BASE_URL = os.getenv(
+    "CAPITAL_BASE_URL",
+    "https://demo-api-capital.backend-capital.com/api/v1"
+)
+
+AUTO_TRADE = os.getenv("AUTO_TRADE", "true").lower() == "true"
 AUTO_TRADE_RUNTIME = {"enabled": AUTO_TRADE}
 
 AUTO_REFRESH_SECONDS = int(os.getenv("AUTO_REFRESH_SECONDS", "60"))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "10"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "4"))
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "62"))
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "100"))
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "60"))
 
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.005"))  # 0.5%
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.005"))
 RR_RATIO = float(os.getenv("RR_RATIO", "1.5"))
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.20"))
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "100.00"))
 NEWS_BLACKOUT = os.getenv("NEWS_BLACKOUT", "false").lower() == "true"
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "trade_state.json"))
 
-app = FastAPI(title="Paper Scalping Bot - Alpaca By Abbas")
+app = FastAPI(title="Capital.com Scalping Bot By Abbas")
 
+CAPITAL_SESSION = {
+    "cst": "",
+    "x_security_token": "",
+    "last_login": None,
+}
 
 ASSETS = {
-    "GOLD": {"name": "Gold ETF", "yf": "GLD", "alpaca": "GLD", "fallback_qty": 1},
-    "SILVER": {"name": "Silver ETF", "yf": "SLV", "alpaca": "SLV", "fallback_qty": 1},
-    "WTI": {"name": "WTI Crude Oil ETF", "yf": "USO", "alpaca": "USO", "fallback_qty": 1},
-    "BTC": {"name": "Bitcoin", "yf": "BTC-USD", "alpaca": "BTCUSD", "fallback_qty": 0.001},
+    "GOLD": {"name": "Gold Spot CFD", "capital_epic": "GOLD", "fallback_qty": 1},
+    "SILVER": {"name": "Silver Spot CFD", "capital_epic": "SILVER", "fallback_qty": 1},
+    "WTI": {"name": "WTI Crude Oil CFD", "capital_epic": "OIL_CRUDE", "fallback_qty": 1},
+    "BRENT": {"name": "Brent Crude Oil CFD", "capital_epic": "OIL_BRENT", "fallback_qty": 1},
+    "BTC": {"name": "Bitcoin CFD", "capital_epic": "BTCUSD", "fallback_qty": 0.01},
+    "ETH": {"name": "Ethereum CFD", "capital_epic": "ETHUSD", "fallback_qty": 0.1},
+    "USTECH100": {"name": "US Tech 100 CFD", "capital_epic": "US100", "fallback_qty": 1},
 }
 
 INTERVALS = {
-    "1M": {"interval": "1m", "period": "2d"},
-    "5M": {"interval": "5m", "period": "5d"},
-    "15M": {"interval": "15m", "period": "10d"},
-    "30M": {"interval": "30m", "period": "30d"},
+    "1M": "MINUTE",
+    "5M": "MINUTE_5",
+    "15M": "MINUTE_15",
+    "30M": "MINUTE_30",
 }
+
+
+def safe_float(x, default=0.0):
+    try:
+        if x is None or pd.isna(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 
 def load_state():
@@ -55,7 +75,7 @@ def load_state():
             return json.loads(STATE_FILE.read_text())
     except Exception:
         pass
-    return {"date": datetime.now().strftime("%Y-%m-%d"), "trades": [], "virtual_exits": []}
+    return {"date": datetime.now().strftime("%Y-%m-%d"), "trades": []}
 
 
 def save_state(state):
@@ -70,7 +90,6 @@ def reset_state_if_new_day(state):
     if state.get("date") != today:
         state["date"] = today
         state["trades"] = []
-        state["virtual_exits"] = []
     return state
 
 
@@ -86,49 +105,157 @@ def record_trade(row):
     save_state(state)
 
 
-def record_virtual_exit(row):
-    state = reset_state_if_new_day(load_state())
-    exits = state.setdefault("virtual_exits", [])
-    exits.append(row)
-    state["virtual_exits"] = exits[-50:]
-    save_state(state)
+def capital_login_headers():
+    return {
+        "X-CAP-API-KEY": CAPITAL_API_KEY.strip(),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
 
 
-def safe_float(x, default=0.0):
+def capital_auth_headers():
+    return {
+        "X-CAP-API-KEY": CAPITAL_API_KEY.strip(),
+        "CST": CAPITAL_SESSION["cst"],
+        "X-SECURITY-TOKEN": CAPITAL_SESSION["x_security_token"],
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+async def capital_login():
+    if not CAPITAL_API_KEY or not CAPITAL_IDENTIFIER or not CAPITAL_PASSWORD:
+        return {"ok": False, "error": "Missing Capital.com API environment variables"}
+
+    payload = {
+        "identifier": CAPITAL_IDENTIFIER.strip(),
+        "password": CAPITAL_PASSWORD.strip(),
+        "encryptedPassword": False,
+    }
+
     try:
-        if x is None or pd.isna(x):
-            return default
-        return float(x)
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                f"{CAPITAL_BASE_URL.rstrip('/')}/session",
+                headers=capital_login_headers(),
+                json=payload,
+            )
+
+        cst = r.headers.get("CST", "")
+        xsec = r.headers.get("X-SECURITY-TOKEN", "")
+
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+
+        if r.status_code in [200, 201] and cst and xsec:
+            CAPITAL_SESSION["cst"] = cst
+            CAPITAL_SESSION["x_security_token"] = xsec
+            CAPITAL_SESSION["last_login"] = datetime.now(timezone.utc).isoformat()
+            return {"ok": True, "status_code": r.status_code, "message": "Capital.com login OK"}
+
+        return {"ok": False, "status_code": r.status_code, "error": body}
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def ensure_capital_session():
+    if CAPITAL_SESSION["cst"] and CAPITAL_SESSION["x_security_token"]:
+        return {"ok": True}
+    return await capital_login()
+
+
+async def capital_get(path):
+    session = await ensure_capital_session()
+    if not session.get("ok"):
+        return 401, session
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(
+            CAPITAL_BASE_URL.rstrip("/") + path,
+            headers=capital_auth_headers(),
+        )
+
+    if r.status_code == 401:
+        await capital_login()
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(
+                CAPITAL_BASE_URL.rstrip("/") + path,
+                headers=capital_auth_headers(),
+            )
+
+    try:
+        return r.status_code, r.json()
     except Exception:
-        return default
+        return r.status_code, {"raw": r.text}
 
 
-def load_candles(asset_key, tf):
-    meta = ASSETS[asset_key]
-    cfg = INTERVALS[tf]
+async def capital_post(path, payload):
+    session = await ensure_capital_session()
+    if not session.get("ok"):
+        return 401, session
 
-    df = yf.download(
-        meta["yf"],
-        period=cfg["period"],
-        interval=cfg["interval"],
-        progress=False,
-        auto_adjust=False,
-        threads=False,
-    )
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(
+            CAPITAL_BASE_URL.rstrip("/") + path,
+            headers=capital_auth_headers(),
+            json=payload,
+        )
 
-    if df.empty:
+    if r.status_code == 401:
+        await capital_login()
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                CAPITAL_BASE_URL.rstrip("/") + path,
+                headers=capital_auth_headers(),
+                json=payload,
+            )
+
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"raw": r.text}
+
+
+async def load_capital_candles(asset_key, tf):
+    epic = ASSETS[asset_key]["capital_epic"]
+    resolution = INTERVALS.get(tf, "MINUTE")
+
+    code, data = await capital_get(f"/prices/{epic}?resolution={resolution}&max=300")
+
+    if code != 200:
+        print("Capital candle error:", code, data)
         return pd.DataFrame()
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    rows = []
 
-    df = df.reset_index()
-    df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
+    for p in data.get("prices", []):
+        try:
+            op = p.get("openPrice", {})
+            hp = p.get("highPrice", {})
+            lp = p.get("lowPrice", {})
+            cp = p.get("closePrice", {})
 
-    time_col = "datetime" if "datetime" in df.columns else "date"
-    df = df.rename(columns={time_col: "time"})
+            rows.append({
+                "time": p.get("snapshotTimeUTC") or p.get("snapshotTime"),
+                "open": safe_float(op.get("bid") or op.get("ask") or op.get("lastTraded")),
+                "high": safe_float(hp.get("bid") or hp.get("ask") or hp.get("lastTraded")),
+                "low": safe_float(lp.get("bid") or lp.get("ask") or lp.get("lastTraded")),
+                "close": safe_float(cp.get("bid") or cp.get("ask") or cp.get("lastTraded")),
+                "volume": safe_float(p.get("lastTradedVolume"), 0),
+            })
+        except Exception:
+            continue
 
-    df = df[["time", "open", "high", "low", "close", "volume"]].dropna()
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        return df
+
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna()
     df = df[df["close"] > 0]
 
     return df.tail(500)
@@ -157,12 +284,8 @@ def add_indicators(df):
     d["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     d["atr"] = d["tr"].ewm(alpha=1 / 14, adjust=False).mean()
 
-    d["swing_low"] = d["low"].rolling(12).min()
-    d["swing_high"] = d["high"].rolling(12).max()
-
     d["support"] = d["low"].rolling(50).min()
     d["resistance"] = d["high"].rolling(50).max()
-
     d["vol_ma"] = d["volume"].rolling(20).mean()
 
     return d
@@ -171,7 +294,7 @@ def add_indicators(df):
 def generate_scalping_signal(df):
     d = add_indicators(df)
 
-    if len(d) < 80:
+    if len(d) < 30:
         return {
             "signal": "HOLD",
             "confidence": 0,
@@ -182,102 +305,150 @@ def generate_scalping_signal(df):
             "take_profit": 0,
             "stop_loss": 0,
             "risk_per_unit": 0,
-            "reason": "Not enough candle data",
+            "reason": "Not enough Capital.com candle data",
+            "engine": "V4_STRONG_CAPITAL_SIGNAL",
         }
 
     last = d.iloc[-1]
     prev = d.iloc[-2]
+    prev2 = d.iloc[-3]
 
     entry = safe_float(last.close)
-    atr = max(safe_float(last.atr), entry * 0.001)
+    atr = max(safe_float(last.atr), entry * 0.0008)
 
-    uptrend = last.ema9 > last.ema21 and last.close > last.ema21
-    downtrend = last.ema9 < last.ema21 and last.close < last.ema21
+    one_candle_move = ((last.close - prev.close) / max(prev.close, 0.0001)) * 100
+    three_candle_move = ((last.close - prev2.close) / max(prev2.close, 0.0001)) * 100
 
-    pullback_long = last.low <= last.ema9 or last.low <= last.ema21
-    pullback_short = last.high >= last.ema9 or last.high >= last.ema21
+    score = 0
+    reasons = []
 
-    rsi_cross_up = prev.rsi <= 50 and last.rsi > 50
-    rsi_cross_down = prev.rsi >= 50 and last.rsi < 50
+    if last.close > prev.close:
+        score += 12
+        reasons.append("last candle bullish")
+    elif last.close < prev.close:
+        score -= 12
+        reasons.append("last candle bearish")
 
-    volume_ok = last.volume >= safe_float(last.vol_ma, last.volume)
+    if three_candle_move > 0:
+        score += 12
+        reasons.append("3-candle move up")
+    elif three_candle_move < 0:
+        score -= 12
+        reasons.append("3-candle move down")
 
-    swing_low = safe_float(last.swing_low, entry - atr)
-    swing_high = safe_float(last.swing_high, entry + atr)
-    support = safe_float(last.support, entry - atr * 2)
-    resistance = safe_float(last.resistance, entry + atr * 2)
+    if three_candle_move >= 0.03:
+        score += 12
+        reasons.append("bullish momentum")
+    elif three_candle_move <= -0.03:
+        score -= 12
+        reasons.append("bearish momentum")
+
+    if last.ema9 > last.ema21:
+        score += 12
+        reasons.append("EMA bullish")
+    elif last.ema9 < last.ema21:
+        score -= 12
+        reasons.append("EMA bearish")
+
+    if last.ema9 > prev.ema9:
+        score += 10
+        reasons.append("EMA slope up")
+    elif last.ema9 < prev.ema9:
+        score -= 10
+        reasons.append("EMA slope down")
+
+    candle_range = max(last.high - last.low, entry * 0.0001)
+    close_position = (last.close - last.low) / candle_range
+
+    if close_position >= 0.60:
+        score += 10
+        reasons.append("close near candle high")
+    elif close_position <= 0.40:
+        score -= 10
+        reasons.append("close near candle low")
+
+    rsi = safe_float(last.rsi, 50)
+    prev_rsi = safe_float(prev.rsi, 50)
+
+    if rsi >= prev_rsi and rsi >= 52:
+        score += 8
+        reasons.append("RSI strong bullish")
+    elif rsi <= prev_rsi and rsi <= 48:
+        score -= 8
+        reasons.append("RSI strong bearish")
+
+    recent_high = d["high"].tail(6).iloc[:-1].max()
+    recent_low = d["low"].tail(6).iloc[:-1].min()
+
+    if last.close > recent_high:
+        score += 10
+        reasons.append("micro breakout up")
+    elif last.close < recent_low:
+        score -= 10
+        reasons.append("micro breakout down")
+
+    vol_ma = safe_float(last.vol_ma, last.volume)
+
+    if vol_ma > 0 and last.volume >= vol_ma * 0.50:
+        if score > 0:
+            score += 6
+            reasons.append("volume supports buy")
+        elif score < 0:
+            score -= 6
+            reasons.append("volume supports sell")
 
     signal = "HOLD"
-    score = 0
-    reason = "No valid EMA pullback + RSI confirmation"
+    stop_loss = 0
+    take_profit = 0
+    risk = 0
 
-    if uptrend:
-        score += 25
-    if downtrend:
-        score -= 25
-    if pullback_long:
-        score += 18
-    if pullback_short:
-        score -= 18
-    if rsi_cross_up:
-        score += 28
-    if rsi_cross_down:
-        score -= 28
-    if volume_ok and score > 0:
-        score += 8
-    elif volume_ok and score < 0:
-        score -= 8
+    RAW_TRIGGER = 35
 
-    if uptrend and pullback_long and rsi_cross_up:
+    trend_buy = (
+        last.close > last.ema9
+        and last.ema9 > last.ema21
+        and last.ema9 > prev.ema9
+        and rsi >= 52
+    )
+
+    trend_sell = (
+        last.close < last.ema9
+        and last.ema9 < last.ema21
+        and last.ema9 < prev.ema9
+        and rsi <= 48
+    )
+
+    momentum_buy = (
+        three_candle_move >= 0.03
+        and close_position >= 0.60
+    )
+
+    momentum_sell = (
+        three_candle_move <= -0.03
+        and close_position <= 0.40
+    )
+
+    if score >= RAW_TRIGGER and trend_buy and momentum_buy:
         signal = "BUY"
-        reason = "LONG: uptrend confirmed, pullback to EMA9/EMA21, RSI crossed above 50"
+        stop_loss = entry - atr
+        risk = entry - stop_loss
+        take_profit = entry + risk * RR_RATIO
 
-        atr_stop = entry - (1.5 * atr)
-        swing_stop = swing_low - (0.10 * atr)
-        stop_loss = max(atr_stop, swing_stop)
-
-        risk = max(entry - stop_loss, atr * 0.50)
-        rr_target = entry + (risk * RR_RATIO)
-
-        if resistance > entry:
-            take_profit = min(rr_target, resistance)
-            if take_profit <= entry:
-                take_profit = rr_target
-        else:
-            take_profit = rr_target
-
-    elif downtrend and pullback_short and rsi_cross_down:
+    elif score <= -RAW_TRIGGER and trend_sell and momentum_sell:
         signal = "SELL"
-        reason = "SHORT: downtrend confirmed, rally to EMA9/EMA21, RSI crossed below 50"
+        stop_loss = entry + atr
+        risk = stop_loss - entry
+        take_profit = entry - risk * RR_RATIO
 
-        atr_stop = entry + (1.5 * atr)
-        swing_stop = swing_high + (0.10 * atr)
-        stop_loss = min(atr_stop, swing_stop)
-
-        risk = max(stop_loss - entry, atr * 0.50)
-        rr_target = entry - (risk * RR_RATIO)
-
-        if support < entry:
-            take_profit = max(rr_target, support)
-            if take_profit >= entry:
-                take_profit = rr_target
-        else:
-            take_profit = rr_target
-
+    if signal in ["BUY", "SELL"]:
+        confidence = min(95, max(60, abs(score) * 1.8))
     else:
-        stop_loss = 0
-        take_profit = 0
-        risk = 0
-
-    confidence = min(95, max(0, abs(score) * 1.20))
-
-    if signal in ["BUY", "SELL"] and confidence < MIN_CONFIDENCE:
-        signal = "HOLD"
-        reason = "Setup detected but confidence below minimum threshold"
+        confidence = 0
 
     if NEWS_BLACKOUT:
         signal = "HOLD"
-        reason = "News blackout enabled. Trading blocked."
+        confidence = 0
+        reasons.append("News blackout enabled")
 
     return {
         "signal": signal,
@@ -289,145 +460,118 @@ def generate_scalping_signal(df):
         "stop_loss": round(stop_loss, 4),
         "risk_per_unit": round(risk, 4),
         "atr": round(atr, 4),
-        "rsi": round(float(last.rsi), 2),
+        "rsi": round(rsi, 2),
         "ema9": round(float(last.ema9), 4),
         "ema21": round(float(last.ema21), 4),
-        "support": round(support, 4),
-        "resistance": round(resistance, 4),
-        "reason": reason,
+        "support": round(safe_float(last.support, entry - atr * 2), 4),
+        "resistance": round(safe_float(last.resistance, entry + atr * 2), 4),
+        "reason": ", ".join(reasons) if reasons else "No strong setup",
+        "engine": "V4_STRONG_CAPITAL_SIGNAL",
         "rules": {
-            "uptrend": bool(uptrend),
-            "downtrend": bool(downtrend),
-            "pullback_long": bool(pullback_long),
-            "pullback_short": bool(pullback_short),
-            "rsi_cross_up": bool(rsi_cross_up),
-            "rsi_cross_down": bool(rsi_cross_down),
-            "volume_ok": bool(volume_ok),
+            "one_candle_move_pct": round(one_candle_move, 4),
+            "three_candle_move_pct": round(three_candle_move, 4),
+            "score": round(score, 2),
+            "trend_buy": bool(trend_buy),
+            "trend_sell": bool(trend_sell),
+            "momentum_buy": bool(momentum_buy),
+            "momentum_sell": bool(momentum_sell),
             "news_blackout": NEWS_BLACKOUT,
         },
     }
 
 
-def alpaca_headers():
+async def get_capital_account_equity():
+    code, data = await capital_get("/accounts")
+    if code != 200:
+        return 0
+
+    accounts = data.get("accounts", [])
+    if not accounts:
+        return 0
+
+    balance = accounts[0].get("balance", {})
+    return (
+        safe_float(balance.get("balance"), 0)
+        or safe_float(balance.get("available"), 0)
+        or safe_float(balance.get("deposit"), 0)
+    )
+
+
+async def get_capital_market(asset_key):
+    epic = ASSETS[asset_key]["capital_epic"]
+    return await capital_get(f"/markets/{epic}")
+
+
+async def get_capital_quote(asset_key):
+    code, data = await get_capital_market(asset_key)
+
+    if code != 200:
+        return {
+            "price": 0,
+            "bid": 0,
+            "ask": 0,
+            "spread_pct": 999,
+            "source": "capital_market_failed",
+            "status_code": code,
+            "raw": data,
+        }
+
+    snapshot = data.get("snapshot", {})
+
+    bid = safe_float(snapshot.get("bid") or snapshot.get("bidPrice") or snapshot.get("sell"), 0)
+    ask = safe_float(snapshot.get("offer") or snapshot.get("ask") or snapshot.get("offerPrice") or snapshot.get("buy"), 0)
+
+    if bid > 0 and ask > 0:
+        price = round((bid + ask) / 2, 4)
+        spread_pct = ((ask - bid) / price) * 100
+        return {
+            "price": price,
+            "bid": bid,
+            "ask": ask,
+            "spread_pct": round(spread_pct, 4),
+            "source": "capital_market_quote",
+            "epic": ASSETS[asset_key]["capital_epic"],
+        }
+
     return {
-        "APCA-API-KEY-ID": ALPACA_API_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-        "Content-Type": "application/json",
-        "accept": "application/json",
+        "price": 0,
+        "bid": bid,
+        "ask": ask,
+        "spread_pct": 999,
+        "source": "capital_quote_no_bid_ask",
+        "raw": data,
     }
 
 
-async def alpaca_get(path):
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(ALPACA_BASE_URL.rstrip("/") + path, headers=alpaca_headers())
-        try:
-            return r.status_code, r.json()
-        except Exception:
-            return r.status_code, {"raw": r.text}
-    except Exception as e:
-        return 500, {"error": str(e)}
+async def trade_guard(asset_key, spread_pct, execute):
+    if not execute:
+        return False, "Execution disabled"
 
-
-async def alpaca_post(path, payload):
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(
-                ALPACA_BASE_URL.rstrip("/") + path,
-                headers=alpaca_headers(),
-                json=payload,
-            )
-        try:
-            return r.status_code, r.json()
-        except Exception:
-            return r.status_code, {"raw": r.text}
-    except Exception as e:
-        return 500, {"error": str(e)}
-
-
-async def get_account_equity():
-    code, data = await alpaca_get("/v2/account")
-    if code == 200:
-        return safe_float(data.get("equity"), 0)
-    return 0
-
-
-async def get_alpaca_quote(symbol):
-    try:
-        symbol_clean = symbol.replace("/", "").upper()
-
-        if symbol_clean in ["BTCUSD", "ETHUSD"]:
-            url = f"https://data.alpaca.markets/v1beta3/crypto/us/latest/trades?symbols={symbol_clean}"
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.get(url, headers=alpaca_headers())
-            data = r.json()
-            trade = data.get("trades", {}).get(symbol_clean)
-            price = safe_float(trade.get("p"), 0) if trade else 0
-            return {"price": price, "bid": price, "ask": price, "spread_pct": 0}
-
-        url = f"https://data.alpaca.markets/v2/stocks/{symbol_clean}/quotes/latest"
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url, headers=alpaca_headers())
-
-        data = r.json()
-        quote = data.get("quote", {})
-
-        bid = safe_float(quote.get("bp"), 0)
-        ask = safe_float(quote.get("ap"), 0)
-        price = round((bid + ask) / 2, 4) if bid > 0 and ask > 0 else max(bid, ask)
-
-        spread_pct = 0
-        if price > 0 and bid > 0 and ask > 0:
-            spread_pct = ((ask - bid) / price) * 100
-
-        return {"price": price, "bid": bid, "ask": ask, "spread_pct": spread_pct}
-    except Exception:
-        return {"price": 0, "bid": 0, "ask": 0, "spread_pct": 999}
-
-
-async def get_open_positions():
-    code, data = await alpaca_get("/v2/positions")
-    if code != 200:
-        return []
-    return data if isinstance(data, list) else []
-
-
-async def trade_guard(asset_key, spread_pct):
     if not AUTO_TRADE_RUNTIME["enabled"]:
         return False, "Auto Trade OFF"
 
-    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
-        return False, "Missing Alpaca API keys"
+    if not CAPITAL_API_KEY or not CAPITAL_IDENTIFIER or not CAPITAL_PASSWORD:
+        return False, "Missing Capital.com API keys"
 
     if NEWS_BLACKOUT:
         return False, "News blackout active"
 
-    if spread_pct > MAX_SPREAD_PCT:
-        return False, f"Spread too wide: {round(spread_pct, 4)}%"
-
     if today_trade_count() >= MAX_TRADES_PER_DAY:
-        return False, "Daily trade limit reached"
+        return False, f"Daily trade limit reached: {MAX_TRADES_PER_DAY}"
 
-    positions = await get_open_positions()
+    if spread_pct >= 999:
+        return True, "OK - quote unavailable, allowed for demo"
 
-    if len(positions) >= MAX_OPEN_POSITIONS:
-        return False, "Maximum open positions reached"
+    if spread_pct > MAX_SPREAD_PCT:
+        return True, f"OK - spread ignored for demo trade: {round(spread_pct, 4)}%"
 
-    alpaca_symbol = ASSETS[asset_key]["alpaca"].replace("/", "").upper()
-
-    for p in positions:
-        pos_symbol = str(p.get("symbol", "")).replace("/", "").upper()
-        if pos_symbol == alpaca_symbol:
-            return False, "Position already open for this asset"
-
-    return True, "OK"
+    return True, "OK - auto order allowed"
 
 
 async def calculate_qty(asset_key, entry, stop_loss):
     meta = ASSETS[asset_key]
-    symbol = meta["alpaca"].replace("/", "").upper()
+    equity = await get_capital_account_equity()
 
-    equity = await get_account_equity()
     if equity <= 0:
         return meta["fallback_qty"], 0
 
@@ -439,112 +583,49 @@ async def calculate_qty(asset_key, entry, stop_loss):
 
     raw_qty = risk_capital / risk_per_unit
 
-    if symbol in ["BTCUSD", "ETHUSD"]:
-        qty = max(0.0001, round(raw_qty, 6))
+    if asset_key in ["BTC", "ETH"]:
+        qty = max(meta["fallback_qty"], round(raw_qty, 4))
     else:
-        qty = max(1, int(raw_qty))
+        qty = max(meta["fallback_qty"], round(raw_qty, 2))
 
     return qty, round(risk_capital, 2)
 
 
-async def close_position_market(symbol, qty, side):
-    payload = {"symbol": symbol, "side": side, "type": "market", "qty": str(qty), "time_in_force": "gtc"}
-    code, data = await alpaca_post("/v2/orders", payload)
-    return {"status_code": code, "payload": payload, "response": data}
+async def place_capital_order(asset_key, side, signal):
+    quote = await get_capital_quote(asset_key)
 
-
-async def monitor_virtual_exits():
-    state = reset_state_if_new_day(load_state())
-    exits = state.get("virtual_exits", [])
-
-    actions, remaining = [], []
-
-    for item in exits:
-        if item.get("status") != "open":
-            continue
-
-        quote = await get_alpaca_quote(item["symbol"])
-        current = quote["price"]
-
-        if current <= 0:
-            remaining.append(item)
-            continue
-
-        side = item["side"]
-        qty = item["qty"]
-        target = item["take_profit"]
-        stop = item["stop_loss"]
-
-        hit_target = (side == "buy" and current >= target) or (side == "sell" and current <= target)
-        hit_stop = (side == "buy" and current <= stop) or (side == "sell" and current >= stop)
-
-        if hit_target or hit_stop:
-            close_side = "sell" if side == "buy" else "buy"
-            result = await close_position_market(item["symbol"], qty, close_side)
-
-            item["status"] = "closed"
-            item["closed_at"] = datetime.now(timezone.utc).isoformat()
-            item["close_price"] = current
-            item["close_reason"] = "TAKE_PROFIT" if hit_target else "STOP_LOSS"
-            item["close_result"] = result
-
-            actions.append(item)
-        else:
-            remaining.append(item)
-
-    state["virtual_exits"] = remaining
-    save_state(state)
-
-    return actions
-
-
-async def place_scalp_order(asset_key, side, signal):
-    meta = ASSETS[asset_key]
-    symbol = meta["alpaca"].replace("/", "").upper()
-    is_crypto = symbol in ["BTCUSD", "ETHUSD"]
-
-    quote = await get_alpaca_quote(symbol)
     entry = quote["price"] if quote["price"] > 0 else signal["entry"]
+    spread_buffer = max(entry * 0.0003, 0.03)
 
-    stop_loss = signal["stop_loss"]
-    take_profit = signal["take_profit"]
+    atr = safe_float(signal.get("atr"), entry * 0.001)
+    risk_distance = max(atr, spread_buffer * 2)
+
+    side = side.lower()
 
     if side == "buy":
-        take_profit = max(take_profit, entry + 0.02)
-        stop_loss = min(stop_loss, entry - 0.02)
+        stop_loss = entry - risk_distance
+        take_profit = entry + risk_distance * RR_RATIO
+        direction = "BUY"
     else:
-        take_profit = min(take_profit, entry - 0.02)
-        stop_loss = max(stop_loss, entry + 0.02)
+        stop_loss = entry + risk_distance
+        take_profit = entry - risk_distance * RR_RATIO
+        direction = "SELL"
 
     qty, risk_capital = await calculate_qty(asset_key, entry, stop_loss)
 
     payload = {
-        "symbol": symbol,
-        "side": side,
-        "type": "market",
-        "qty": str(qty),
-        "time_in_force": "gtc" if is_crypto else "day",
+        "epic": ASSETS[asset_key]["capital_epic"],
+        "direction": direction,
+        "size": qty,
+        "orderType": "MARKET",
+        "currencyCode": "USD",
+        "forceOpen": True,
+        "guaranteedStop": False,
+        "stopLevel": round(stop_loss, 4),
+        "profitLevel": round(take_profit, 4),
     }
 
-    if not is_crypto:
-        payload["order_class"] = "bracket"
-        payload["take_profit"] = {"limit_price": str(round(take_profit, 2))}
-        payload["stop_loss"] = {"stop_price": str(round(stop_loss, 2))}
-
-    code, data = await alpaca_post("/v2/orders", payload)
-
-    if is_crypto and code in [200, 201]:
-        record_virtual_exit({
-            "status": "open",
-            "time": datetime.now(timezone.utc).isoformat(),
-            "asset": asset_key,
-            "symbol": symbol,
-            "side": side,
-            "qty": qty,
-            "entry": round(entry, 4),
-            "take_profit": round(take_profit, 4),
-            "stop_loss": round(stop_loss, 4),
-        })
+    code, data = await capital_post("/positions", payload)
 
     result = {
         "status_code": code,
@@ -556,13 +637,12 @@ async def place_scalp_order(asset_key, side, signal):
         "qty": qty,
         "risk_capital": risk_capital,
         "spread_pct": round(quote["spread_pct"], 4),
-        "crypto_virtual_tp_sl": is_crypto,
     }
 
     record_trade({
         "time": datetime.now(timezone.utc).isoformat(),
         "asset": asset_key,
-        "symbol": symbol,
+        "epic": ASSETS[asset_key]["capital_epic"],
         "side": side,
         **result,
     })
@@ -570,21 +650,26 @@ async def place_scalp_order(asset_key, side, signal):
     return result
 
 
+@app.get("/api/login")
+async def api_login():
+    return JSONResponse(await capital_login())
+
+
 @app.get("/api/account")
 async def api_account():
-    code, data = await alpaca_get("/v2/account")
+    code, data = await capital_get("/accounts")
     return JSONResponse({"status_code": code, "data": data})
 
 
 @app.get("/api/positions")
 async def api_positions():
-    code, data = await alpaca_get("/v2/positions")
+    code, data = await capital_get("/positions")
     return JSONResponse({"status_code": code, "data": data})
 
 
 @app.get("/api/orders")
 async def api_orders():
-    code, data = await alpaca_get("/v2/orders?status=all&limit=20")
+    code, data = await capital_get("/workingorders")
     return JSONResponse({"status_code": code, "data": data})
 
 
@@ -600,7 +685,7 @@ async def run_now(asset: str = Form("WTI"), tf: str = Form("1M"), execute: str =
 
 
 @app.get("/api/run-signal")
-async def api_run_signal(asset: str = Query("GOLD"), tf: str = Query("1M"), execute: bool = Query(False)):
+async def api_run_signal(asset: str = Query("WTI"), tf: str = Query("1M"), execute: bool = Query(False)):
     return await run_signal_core(asset, tf, execute)
 
 
@@ -608,25 +693,21 @@ async def run_signal_core(asset: str, tf: str, execute: bool):
     asset = asset.upper()
     tf = tf.upper()
 
-    virtual_exit_actions = await monitor_virtual_exits()
-
     if asset not in ASSETS:
         return {"error": "Invalid asset"}
 
     if tf not in INTERVALS:
         return {"error": "Invalid timeframe"}
 
-    df = load_candles(asset, tf)
+    df = await load_capital_candles(asset, tf)
 
     if df.empty:
-        return {"error": "No market data returned"}
+        return {"error": "No Capital.com market data returned"}
 
     signal = generate_scalping_signal(df)
+    quote = await get_capital_quote(asset)
 
-    symbol = ASSETS[asset]["alpaca"].replace("/", "").upper()
-    quote = await get_alpaca_quote(symbol)
-
-    allowed, guard_reason = await trade_guard(asset, quote["spread_pct"])
+    allowed, guard_reason = await trade_guard(asset, quote["spread_pct"], execute)
 
     trade_result = None
 
@@ -640,20 +721,23 @@ async def run_signal_core(asset: str, tf: str, execute: bool):
 
     if should_execute:
         side = "buy" if signal["signal"] == "BUY" else "sell"
-        trade_result = await place_scalp_order(asset, side, signal)
+        trade_result = await place_capital_order(asset, side, signal)
 
     return {
         "asset": asset,
         "name": ASSETS[asset]["name"],
-        "trade_symbol": ASSETS[asset]["alpaca"],
-        "data_symbol": ASSETS[asset]["yf"],
+        "trade_symbol": ASSETS[asset]["capital_epic"],
+        "data_symbol": ASSETS[asset]["capital_epic"],
+        "data_source": "Capital.com candles",
         "timeframe": tf,
+        "broker": "Capital.com",
         "auto_trade_enabled": AUTO_TRADE_RUNTIME["enabled"],
         "auto_refresh_seconds": AUTO_REFRESH_SECONDS,
         "execute_requested": execute,
         "guard_allowed": allowed,
         "guard_reason": guard_reason,
         "daily_trade_count": today_trade_count(),
+        "max_trades_per_day": MAX_TRADES_PER_DAY,
         "risk_per_trade_pct": RISK_PER_TRADE_PCT,
         "rr_ratio": RR_RATIO,
         "max_spread_pct": MAX_SPREAD_PCT,
@@ -661,7 +745,7 @@ async def run_signal_core(asset: str, tf: str, execute: bool):
         "signal": signal,
         "scalping_possible": should_execute,
         "trade_result": trade_result,
-        "virtual_exit_actions": virtual_exit_actions,
+        "capital_session_active": bool(CAPITAL_SESSION["cst"] and CAPITAL_SESSION["x_security_token"]),
         "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -690,7 +774,7 @@ async def home(asset: str = Query("WTI"), tf: str = Query("1M"), execute: bool =
 <!doctype html>
 <html>
 <head>
-<title>Paper Scalping Bot By Abbas</title>
+<title>Capital.com Scalping Bot By Abbas</title>
 <meta http-equiv="refresh" content="{AUTO_REFRESH_SECONDS}; url=/?asset={asset}&tf={tf}&execute=true">
 <style>
 body{{background:#050812;color:white;font-family:Arial;margin:0;padding:28px 20px 20px 20px}}
@@ -706,10 +790,11 @@ pre{{white-space:pre-wrap;background:#020617;padding:12px;border-radius:12px}}
 </style>
 </head>
 <body>
+
 <div id="progress-container"><div id="progress-bar"></div></div>
 
-<h2>Paper Scalping Bot — Alpaca Paper API <span class="name">By: Abbas</span></h2>
-<div class="small">EMA 9/21 Pullback + RSI 50 Cross + ATR Stop + RR Target</div>
+<h2>Capital.com Strong Signal Scalping Bot <span class="name">By: Abbas</span></h2>
+<div class="small">V4 Strong Signal: Capital.com candles + Capital.com execution</div>
 
 <div class="card">
 <form method="post" action="/toggle-auto-trade" style="display:inline;">
@@ -722,9 +807,10 @@ pre{{white-space:pre-wrap;background:#020617;padding:12px;border-radius:12px}}
 <select name="asset">{html_options(asset, ASSETS.keys())}</select>
 <select name="tf">{html_options(tf, INTERVALS.keys())}</select>
 <button type="submit" name="execute" value="false">Check Signal Only</button>
-<button type="submit" name="execute" value="true">Run + Place Paper Trade</button>
+<button type="submit" name="execute" value="true">Run + Place Capital Trade</button>
 </form>
 
+<form method="get" action="/api/login" style="display:inline;"><button type="submit">Login</button></form>
 <form method="get" action="/api/account" style="display:inline;"><button type="submit">Account</button></form>
 <form method="get" action="/api/positions" style="display:inline;"><button type="submit">Positions</button></form>
 <form method="get" action="/api/orders" style="display:inline;"><button type="submit">Orders</button></form>
@@ -734,16 +820,19 @@ pre{{white-space:pre-wrap;background:#020617;padding:12px;border-radius:12px}}
 <h3 class="{signal_class}">{signal_text}</h3>
 <p>
 Asset: {data.get("asset")}<br>
-Trade Symbol: {data.get("trade_symbol")}<br>
+Broker: Capital.com<br>
+Trade Symbol / EPIC: {data.get("trade_symbol")}<br>
+Data Source: {data.get("data_source")}<br>
 Price: {data.get("signal", {}).get("price")}<br>
 Entry: {data.get("signal", {}).get("entry")}<br>
 Take Profit: {data.get("signal", {}).get("take_profit")}<br>
 Stop Loss: {data.get("signal", {}).get("stop_loss")}<br>
 Confidence: {data.get("signal", {}).get("confidence")}%<br>
+Engine: {data.get("signal", {}).get("engine")}<br>
 Reason: {data.get("signal", {}).get("reason")}<br>
 Guard: {data.get("guard_reason")}<br>
 Auto Trade Enabled: {data.get("auto_trade_enabled")}<br>
-Daily Trades: {data.get("daily_trade_count")}<br>
+Daily Trades: {data.get("daily_trade_count")} / {data.get("max_trades_per_day")}<br>
 Updated: {data.get("updated")}
 </p>
 </div>
@@ -764,5 +853,5 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8000")),
-        reload=True,
+        reload=False,
     )
